@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-Immersive Lyric Engine - Audio Sniffer Service
-Listens to system audio via PulseAudio, performs FFT analysis,
-and streams frequency data to connected WebSocket clients.
+Immersive Lyric Engine - Audio Sniffer & Lyric Forwarder Service
+Two roles:
+1. Listens to system audio via PulseAudio, performs FFT, streams frequency data
+2. Receives lyric updates from Tampermonkey via WebSocket, forwards to local-player
 """
 
 import sys
@@ -11,12 +12,13 @@ import numpy as np
 import websockets
 import logging
 from datetime import datetime
+import json
 
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
 )
-log = logging.getLogger('AudioSniffer')
+log = logging.getLogger('AudioLyricService')
 
 try:
     import pulsectl
@@ -34,6 +36,7 @@ except ImportError:
 
 HOST = 'localhost'
 PORT = 8765
+LYRIC_PORT = 8766
 FPS = 60
 CHUNK_DURATION_MS = 50
 SAMPLE_RATE = 44100
@@ -51,7 +54,47 @@ def compute_frequency_bands(fft_data, sample_rate, n_bands):
         bands.append(float(band_energy))
     return bands
 
-async def run_pulse_capture(websocket):
+async def broadcast_to_players(message):
+    """Broadcast message to all connected local-player clients."""
+    if broadcast_to_players.players:
+        await asyncio.gather(
+            *[p.send(message) for p in broadcast_to_players.players],
+            return_exceptions=True
+        )
+broadcast_to_players.players = set()
+
+async def register_player(websocket):
+    broadcast_to_players.players.add(websocket)
+    log.info(f"Player registered. Total players: {len(broadcast_to_players.players)}")
+    try:
+        await websocket.wait_closed()
+    finally:
+        broadcast_to_players.players.discard(websocket)
+        log.info(f"Player unregistered. Total players: {len(broadcast_to_players.players)}")
+
+async def lyric_from_tampermonkey(websocket):
+    """Receive lyrics from Tampermonkey script and broadcast to players."""
+    log.info("Tampermonkey client connected for lyric forwarding")
+    try:
+        async for message in websocket:
+            try:
+                data = json.loads(message)
+                if data.get('type') == 'lyric':
+                    lyric_text = data.get('text', '')
+                    await broadcast_to_players(json.dumps({
+                        'type': 'lyric',
+                        'text': lyric_text,
+                        'timestamp': datetime.now().isoformat()
+                    }))
+                    log.info(f"Forwarded lyric: {lyric_text[:30]}...")
+                elif data.get('type') == 'status'):
+                    log.info(f"Tampermonkey status: {data.get('message', '')}")
+            except json.JSONDecodeError:
+                log.warning(f"Invalid JSON from Tampermonkey: {message[:100]}")
+    except websockets.exceptions.ConnectionClosed:
+        log.info("Tampermonkey client disconnected")
+
+async def run_pulse_capture():
     log.info("Starting PulseAudio capture...")
     pulse = pulsectl.Pulse('audio-sniffer')
 
@@ -64,11 +107,10 @@ async def run_pulse_capture(websocket):
                 break
 
         if not monitor_name:
-            await websocket.send('{"error": "No monitor source found"}')
+            log.error("No monitor source found")
             return
 
         audio_queue = asyncio.Queue()
-        chunk_size = int(SAMPLE_RATE * CHUNK_DURATION_MS / 1000)
 
         def audio_callback(pa_index, data, timestamp):
             if len(data) > 0:
@@ -78,7 +120,7 @@ async def run_pulse_capture(websocket):
                 asyncio.create_task(audio_queue.put(audio_data.copy()))
 
         stream = pulse.stream_new('audio-sniffer', 'audio float32', 2)
-        pulse.stream_connect_input(stream, monitor_name, null=True, audio_callback)
+        pulse.stream_connect_input(stream, monitor_name, audio_callback, null=True)
 
         log.info(f"Capturing from {monitor_name}")
 
@@ -98,23 +140,24 @@ async def run_pulse_capture(websocket):
                 mid = float(np.mean(bands[4:16]))
                 high = float(np.mean(bands[16:]))
 
-                timestamp = datetime.now().isoformat()
-                msg = f'{{"bass":{bass:.6f},"mid":{mid:.6f},"high":{high:.6f},"timestamp":"{timestamp}"}}'
+                msg = json.dumps({
+                    'bass': bass,
+                    'mid': mid,
+                    'high': high,
+                    'timestamp': datetime.now().isoformat()
+                })
 
-                await websocket.send(msg)
+                await broadcast_to_players(msg)
 
             except asyncio.TimeoutError:
                 continue
 
-    except websockets.exceptions.ConnectionClosed:
-        log.info("Client disconnected")
     except Exception as e:
         log.error(f"PulseAudio capture error: {e}")
-        await websocket.send(f'{{"error": "{e}"}}')
     finally:
         pulse.close()
 
-async def run_sounddevice_capture(websocket):
+async def run_sounddevice_capture():
     log.info("Starting sounddevice capture...")
 
     q = asyncio.Queue()
@@ -169,43 +212,46 @@ async def run_sounddevice_capture(websocket):
                 mid = float(np.mean(bands[4:16]))
                 high = float(np.mean(bands[16:]))
 
-                timestamp = datetime.now().isoformat()
-                msg = f'{{"bass":{bass:.6f},"mid":{mid:.6f},"high":{high:.6f},"timestamp":"{timestamp}"}}'
+                msg = json.dumps({
+                    'bass': bass,
+                    'mid': mid,
+                    'high': high,
+                    'timestamp': datetime.now().isoformat()
+                })
 
-                await websocket.send(msg)
+                await broadcast_to_players(msg)
 
-    except websockets.exceptions.ConnectionClosed:
-        log.info("Client disconnected")
     except Exception as e:
         log.error(f"Sounddevice capture error: {e}")
-        await websocket.send(f'{{"error": "{e}"}}')
     finally:
         running = False
 
-async def handler(websocket, path):
-    log.info(f"Client connected from {websocket.remote_address}")
-    try:
-        await websocket.send(f'{{"status": "connected", "fps": {FPS}}}')
+async def audio_handler(websocket, path):
+    await register_player(websocket)
 
-        if PULSECTL_AVAILABLE:
-            await run_pulse_capture(websocket)
-        elif SOUNDDEVICE_AVAILABLE:
-            await run_sounddevice_capture(websocket)
-        else:
-            await websocket.send('{"error": "No audio capture available"}')
-            log.error("No audio capture library available!")
-    except websockets.exceptions.ConnectionClosed:
-        log.info(f"Client {websocket.remote_address} disconnected")
+async def lyric_handler(websocket, path):
+    await lyric_from_tampermonkey(websocket)
 
 async def main():
-    log.info(f"Starting Audio Sniffer WebSocket server on {HOST}:{PORT}")
+    log.info(f"Starting Audio Lyric Service")
+    log.info(f"Audio WebSocket: ws://{HOST}:{PORT}")
+    log.info(f"Lyric WebSocket: ws://{HOST}:{LYRIC_PORT}")
 
     if not PULSECTL_AVAILABLE and not SOUNDDEVICE_AVAILABLE:
-        log.error("No audio capture library available! Install pulsectl or sounddevice.")
+        log.error("No audio capture library available!")
         sys.exit(1)
 
-    async with websockets.serve(handler, HOST, PORT):
-        log.info(f"Server started. Connect ws://{HOST}:{PORT}")
+    audio_task = None
+    if PULSECTL_AVAILABLE:
+        audio_task = asyncio.create_task(run_pulse_capture())
+    elif SOUNDDEVICE_AVAILABLE:
+        audio_task = asyncio.create_task(run_sounddevice_capture())
+
+    async with (
+        websockets.serve(audio_handler, HOST, PORT),
+        websockets.serve(lyric_handler, HOST, LYRIC_PORT)
+    ):
+        log.info("All servers started. Press Ctrl+C to stop.")
         await asyncio.Future()
 
 if __name__ == '__main__':

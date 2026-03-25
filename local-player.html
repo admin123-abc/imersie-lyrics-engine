@@ -521,10 +521,22 @@
         ws.onmessage = (event) => {
           try {
             const data = JSON.parse(event.data);
+
+            if (data.type === 'lyric') {
+              if (data.text && data.text !== lastText) {
+                lastText = data.text;
+                lyricTextEl.textContent = data.text;
+                lyricTranslationEl.textContent = '';
+                rebuildParticles(data.text || '♪');
+              }
+              return;
+            }
+
             if (data.error) {
               setStatus('音频服务错误: ' + data.error, 'error');
               return;
             }
+
             bassEnergy = Math.min(1.0, data.bass * 10 || 0);
             midEnergy = Math.min(1.0, data.mid * 20 || 0);
             highEnergy = Math.min(1.0, data.high * 30 || 0);
@@ -616,7 +628,7 @@
     });
 
     buildParticleLayers();
-    setStatus('就绪，先启动 Python 音频服务，再输入音频链接', '');
+    setStatus('就绪！启动 Python 服务后，歌词从网易云页面自动获取，音频从系统捕获', '');
 
     connectWebSocket();
   </script>
