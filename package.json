@@ -1,0 +1,17 @@
+{
+  "name": "immersive-lyric-engine",
+  "version": "1.0.0",
+  "private": true,
+  "description": "3D immersive particle lyric visualizer for Netease Cloud Music web player",
+  "type": "module",
+  "scripts": {
+    "dev": "vite build --watch",
+    "build": "vite build"
+  },
+  "dependencies": {
+    "three": "^0.170.0"
+  },
+  "devDependencies": {
+    "vite": "^6.0.0"
+  }
+}
