@@ -85,6 +85,7 @@
     }
     .status.error { color: #ff4444; }
     .status.success { color: #44ff88; }
+    .status.connecting { color: #ffaa00; }
     audio { display: none; }
     canvas {
       position: fixed;
@@ -151,14 +152,10 @@
   <script type="module">
     import * as THREE from 'three';
 
-    // -- Constants --
+    const WS_URL = 'ws://localhost:8765';
     const PARTICLE_COUNT = 8000;
-    const FFT_SIZE = 2048;
-    const BASS_BIN_START = 1;
-    const BASS_BIN_END = 4;
     const SYNC_TOLERANCE_MS = 200;
 
-    // -- DOM --
     const audioUrlInput = document.getElementById('audioUrl');
     const playBtn = document.getElementById('playBtn');
     const lyricInput = document.getElementById('lyricInput');
@@ -168,11 +165,9 @@
     const lyricTranslationEl = document.getElementById('lyricTranslation');
     const audioEl = document.getElementById('audio');
 
-    // -- State --
-    let audioContext = null;
-    let analyser = null;
-    let dataBuffer = null;
     let bassEnergy = 0;
+    let midEnergy = 0;
+    let highEnergy = 0;
     let running = false;
 
     let lines = [];
@@ -180,7 +175,6 @@
     let cursor = 0;
     let lastText = null;
 
-    // -- Three.js Setup --
     const scene = new THREE.Scene();
     const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.01, 100);
     camera.position.z = 1;
@@ -192,13 +186,14 @@
 
     const clock = new THREE.Clock();
 
-    // -- Shaders --
     const vertexShader = `
       attribute float aSize;
       attribute float aAlpha;
       attribute vec3 aColor;
       uniform float uTime;
       uniform float uBassEnergy;
+      uniform float uMidEnergy;
+      uniform float uHighEnergy;
       uniform float uFade;
       varying float vAlpha;
       varying vec3 vColor;
@@ -211,10 +206,11 @@
         pos.x += sin(uTime * 1.1 + phase) * 0.04 * uFade;
         pos.y += cos(uTime * 0.9 + phase * 1.3) * 0.03 * uFade;
         float dist = length(pos.xy);
-        float impulse = uBassEnergy * 0.8 * smoothstep(0.0, 0.5, dist);
+        float bassImpulse = uBassEnergy * 0.6 * smoothstep(0.0, 0.5, dist);
+        float midImpulse = uMidEnergy * 0.3 * sin(uTime * 3.0 + phase * 2.0) * smoothstep(0.2, 0.6, dist);
         float angle = atan(pos.y, pos.x);
-        pos.x += cos(angle) * impulse;
-        pos.y += sin(angle) * impulse;
+        pos.x += cos(angle) * (bassImpulse + midImpulse);
+        pos.y += sin(angle) * (bassImpulse + midImpulse);
         vec4 mvPos = modelViewMatrix * vec4(pos, 1.0);
         gl_PointSize = aSize * (300.0 / -mvPos.z);
         gl_Position = projectionMatrix * mvPos;
@@ -224,6 +220,7 @@
     const fragmentShader = `
       precision highp float;
       uniform float uBassEnergy;
+      uniform float uHighEnergy;
       varying float vAlpha;
       varying vec3 vColor;
       void main() {
@@ -233,13 +230,13 @@
         float glow = 1.0 - d;
         glow = pow(glow, 1.5);
         vec3 color = vColor;
-        color = mix(color, vec3(0.7, 0.9, 1.0), uBassEnergy * 0.4);
+        color = mix(color, vec3(0.7, 0.9, 1.0), uBassEnergy * 0.5);
+        color = mix(color, vec3(1.0, 0.5, 0.8), uHighEnergy * 0.3);
         float alpha = vAlpha * glow;
         gl_FragColor = vec4(color, alpha);
       }
     `;
 
-    // -- Create Particle Layers --
     const layers = [];
     const LAYER_COUNT = 5;
     const LAYER_DEPTH_SPACING = 0.04;
@@ -257,7 +254,6 @@
 
     function createParticleGeometry(count, zDepth, scale) {
       const positions = new Float32Array(count * 3);
-      const basePositions = new Float32Array(count * 3);
       const alphas = new Float32Array(count);
       const colors = new Float32Array(count * 3);
       const sizes = new Float32Array(count);
@@ -267,22 +263,12 @@
         const phi = Math.acos(2 * Math.random() - 1);
         const r = 0.3 + Math.random() * 0.3;
 
-        const x = r * Math.sin(phi) * Math.cos(theta) * scale;
-        const y = r * Math.sin(phi) * Math.sin(theta) * scale;
-        const z = zDepth + (Math.random() - 0.5) * 0.02;
-
-        positions[i * 3] = x;
-        positions[i * 3 + 1] = y;
-        positions[i * 3 + 2] = z;
-        basePositions[i * 3] = x;
-        basePositions[i * 3 + 1] = y;
-        basePositions[i * 3 + 2] = z;
+        positions[i * 3] = r * Math.sin(phi) * Math.cos(theta) * scale;
+        positions[i * 3 + 1] = r * Math.sin(phi) * Math.sin(theta) * scale;
+        positions[i * 3 + 2] = zDepth + (Math.random() - 0.5) * 0.02;
 
         const t = Math.random();
-        let c;
-        if (t < 0.4) c = CYAN;
-        else if (t < 0.7) c = MAGENTA;
-        else c = WHITE;
+        let c = t < 0.4 ? CYAN : (t < 0.7 ? MAGENTA : WHITE);
 
         colors[i * 3] = c.r;
         colors[i * 3 + 1] = c.g;
@@ -298,7 +284,7 @@
       geometry.setAttribute('aColor', new THREE.BufferAttribute(colors, 3));
       geometry.setAttribute('aSize', new THREE.BufferAttribute(sizes, 1));
 
-      return { geometry, basePositions };
+      return geometry;
     }
 
     function buildParticleLayers() {
@@ -308,7 +294,7 @@
         const depth = (i - LAYER_COUNT / 2) * LAYER_DEPTH_SPACING;
         const scale = 1.0 + (i - LAYER_COUNT / 2) * 0.05;
 
-        const { geometry, basePositions } = createParticleGeometry(particlesPerLayer, depth, scale);
+        const geometry = createParticleGeometry(particlesPerLayer, depth, scale);
 
         const material = new THREE.ShaderMaterial({
           vertexShader,
@@ -316,6 +302,8 @@
           uniforms: {
             uTime: { value: 0 },
             uBassEnergy: { value: 0 },
+            uMidEnergy: { value: 0 },
+            uHighEnergy: { value: 0 },
             uFade: { value: 0 },
           },
           transparent: true,
@@ -326,11 +314,10 @@
         const points = new THREE.Points(geometry, material);
         scene.add(points);
 
-        layers.push({ points, geometry, material, basePositions });
+        layers.push({ points, geometry, material });
       }
     }
 
-    // -- Text to Bitmap --
     function textToBitmap(text) {
       const canvas = document.createElement('canvas');
       canvas.width = 1024;
@@ -351,7 +338,6 @@
 
     function sampleBitmap(data) {
       const { width, height, data: pixels } = data;
-      const centers = [];
       const N = Math.floor(PARTICLE_COUNT * 0.7);
 
       const brightPixels = [];
@@ -364,18 +350,19 @@
         }
       }
 
-      if (brightPixels.length === 0) return centers;
+      if (brightPixels.length === 0) return [];
 
+      const targets = [];
       for (let k = 0; k < N; k++) {
         const idx = Math.floor(Math.random() * brightPixels.length);
         const [bx, by] = brightPixels[idx];
-        centers.push([
+        targets.push([
           bx + (Math.random() - 0.5) * 0.008,
           by + (Math.random() - 0.5) * 0.008,
         ]);
       }
 
-      return centers;
+      return targets;
     }
 
     function scatterParticlesToPositions(layer, targets) {
@@ -406,7 +393,6 @@
       }
     }
 
-    // -- LRC Parser --
     const LRC_LINE_RE = /(\[(?:\d+:\d{2}[.:]\d{2,3})\])+([^\[]*)/g;
     const TIMECODE_RE = /\[(\d+):(\d{2})[.:](\d{2,3})\]/;
 
@@ -448,37 +434,6 @@
       return { main, translation };
     }
 
-    // -- Audio Setup --
-    function setupAudio() {
-      audioContext = new (window.AudioContext || window.webkitAudioContext)();
-      analyser = audioContext.createAnalyser();
-      analyser.fftSize = FFT_SIZE;
-      analyser.smoothingTimeConstant = 0.75;
-      dataBuffer = new Uint8Array(analyser.frequencyBinCount);
-
-      const source = audioContext.createMediaElementSource(audioEl);
-      source.connect(analyser);
-      analyser.connect(audioContext.destination);
-
-      if (audioContext.state === 'suspended') {
-        audioContext.resume();
-      }
-
-      setStatus('音频上下文已创建', 'success');
-    }
-
-    function computeBassEnergy() {
-      if (!analyser || !dataBuffer) return 0;
-      analyser.getByteFrequencyData(dataBuffer);
-      let sum = 0, count = 0;
-      for (let i = BASS_BIN_START; i <= BASS_BIN_END && i < dataBuffer.length; i++) {
-        sum += dataBuffer[i];
-        count++;
-      }
-      return count > 0 ? sum / (count * 255) : 0;
-    }
-
-    // -- Lyric Sync --
     function binarySearchCursor(targetMs) {
       let lo = 0;
       let hi = lines.length - 1;
@@ -518,10 +473,8 @@
       }
     }
 
-    // -- Render Loop --
     let fadeAlpha = 0;
     let targetAlpha = 1;
-    const FADE_DURATION_MS = 400;
 
     function render() {
       if (!running) return;
@@ -529,31 +482,75 @@
       requestAnimationFrame(render);
 
       const elapsed = clock.getElapsedTime();
-      bassEnergy = computeBassEnergy();
-
       const currentMs = audioEl.currentTime * 1000;
+
       if (audioEl.duration > 0) {
         advanceCursor(currentMs);
       }
 
-      // Fade animation
       const fadeDiff = targetAlpha - fadeAlpha;
       if (Math.abs(fadeDiff) > 0.01) {
         fadeAlpha += fadeDiff * 0.1;
       }
 
-      // Update uniforms
       for (const layer of layers) {
         const uniforms = layer.material.uniforms;
         uniforms.uTime.value = elapsed;
         uniforms.uBassEnergy.value = bassEnergy;
+        uniforms.uMidEnergy.value = midEnergy;
+        uniforms.uHighEnergy.value = highEnergy;
         uniforms.uFade.value = Math.max(0, fadeAlpha);
       }
 
       renderer.render(scene, camera);
     }
 
-    // -- UI Events --
+    let ws = null;
+    let wsReconnectDelay = 1000;
+
+    async function connectWebSocket() {
+      try {
+        setStatus('正在连接音频服务...', 'connecting');
+        ws = new WebSocket(WS_URL);
+
+        ws.onopen = () => {
+          setStatus('已连接音频服务，播放音乐吧！', 'success');
+          wsReconnectDelay = 1000;
+        };
+
+        ws.onmessage = (event) => {
+          try {
+            const data = JSON.parse(event.data);
+            if (data.error) {
+              setStatus('音频服务错误: ' + data.error, 'error');
+              return;
+            }
+            bassEnergy = Math.min(1.0, data.bass * 10 || 0);
+            midEnergy = Math.min(1.0, data.mid * 20 || 0);
+            highEnergy = Math.min(1.0, data.high * 30 || 0);
+          } catch (e) {
+            console.warn('WS parse error:', e);
+          }
+        };
+
+        ws.onclose = () => {
+          setStatus('音频服务已断开，刷新页面重连', 'error');
+          ws = null;
+          if (running) {
+            setTimeout(connectWebSocket, wsReconnectDelay);
+            wsReconnectDelay = Math.min(wsReconnectDelay * 2, 10000);
+          }
+        };
+
+        ws.onerror = (err) => {
+          setStatus('WebSocket 连接失败', 'error');
+        };
+
+      } catch (err) {
+        setStatus('无法连接音频服务: ' + err.message, 'error');
+      }
+    }
+
     playBtn.addEventListener('click', async () => {
       const url = audioUrlInput.value.trim();
       if (!url) {
@@ -562,13 +559,8 @@
       }
 
       try {
-        if (!audioContext) {
-          setupAudio();
-        }
-
         audioEl.src = url;
         audioEl.volume = 1;
-
         await audioEl.play();
         setStatus('播放中...', 'success');
 
@@ -617,16 +609,16 @@
       statusEl.className = 'status ' + type;
     }
 
-    // -- Resize --
     window.addEventListener('resize', () => {
       camera.aspect = window.innerWidth / window.innerHeight;
       camera.updateProjectionMatrix();
       renderer.setSize(window.innerWidth, window.innerHeight);
     });
 
-    // -- Init --
     buildParticleLayers();
-    setStatus('就绪，请输入音频链接或粘贴歌词 JSON', '');
+    setStatus('就绪，先启动 Python 音频服务，再输入音频链接', '');
+
+    connectWebSocket();
   </script>
 </body>
 </html>
